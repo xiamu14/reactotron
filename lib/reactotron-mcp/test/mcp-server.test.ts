@@ -67,6 +67,15 @@ function connectMockApp(
   })
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 1000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (predicate()) return
+    await new Promise((r) => setTimeout(r, 25))
+  }
+  throw new Error("Timed out waiting for condition")
+}
+
 let relayPort: number
 let mcpPort: number
 let relay: ReturnType<typeof createServer>
@@ -193,9 +202,44 @@ describe("resources", () => {
       expect(data._meta.connection).toBe("single_app")
       expect(data.apps.length).toBe(1)
       expect(data.apps[0].name).toBe("TestApp")
+      expect(data.apps[0].connected).toBe(true)
     } finally {
       app.close()
     }
+  })
+
+  test("keeps recent app info after disconnect", async () => {
+    const app = await connectMockApp(relayPort)
+    app.send(JSON.stringify({ type: "log", payload: { message: "before disconnect" } }))
+    await new Promise((r) => setTimeout(r, 100))
+    await new Promise<void>((resolve) => {
+      app.once("close", () => resolve())
+      app.close()
+    })
+    await waitFor(() => relay.connections.length === 0)
+
+    const appsRes = await mcpRequest(mcpPort, {
+      jsonrpc: "2.0",
+      method: "resources/read",
+      id: 41,
+      params: { uri: "reactotron://apps" },
+    })
+    const appsResult = parseSSE(appsRes.body)
+    const appsData = JSON.parse(appsResult.result.contents[0].text)
+    expect(appsData._meta.connection).toBe("recent_app_disconnected")
+    expect(appsData.apps.length).toBe(1)
+    expect(appsData.apps[0].connected).toBe(false)
+
+    const timelineRes = await mcpRequest(mcpPort, {
+      jsonrpc: "2.0",
+      method: "resources/read",
+      id: 42,
+      params: { uri: "reactotron://timeline" },
+    })
+    const timelineResult = parseSSE(timelineRes.body)
+    const timelineData = JSON.parse(timelineResult.result.contents[0].text)
+    expect(timelineData._meta.connection).toBe("recent_app_disconnected")
+    expect(timelineData.eventCount).toBeGreaterThanOrEqual(2)
   })
 
   test("reads timeline with buffered events", async () => {
@@ -217,8 +261,7 @@ describe("resources", () => {
       expect(data.events.length).toBeGreaterThanOrEqual(2)
       const logEvent = data.events.find((e: any) => e.type === "log")
       expect(logEvent).toBeDefined()
-      // Timeline events are now summarized — payload is replaced with payloadPreview
-      expect(logEvent.payloadPreview).toContain("hello")
+      expect(logEvent.payloadPreview).toBe("[filtered log event — use query_logs with prefix]")
     } finally {
       app.close()
     }
@@ -236,7 +279,7 @@ describe("resources", () => {
     expect(data.state.status).toBe("no_state_received")
   })
 
-  test("reads asyncstorage mutations", async () => {
+  test("asyncstorage resource requires explicit key-based query", async () => {
     const app = await connectMockApp(relayPort)
     try {
       app.send(
@@ -255,9 +298,9 @@ describe("resources", () => {
       })
       const result = parseSSE(res.body)
       const data = JSON.parse(result.result.contents[0].text)
-      expect(data.mutations.length).toBe(1)
-      expect(data.mutations[0].action).toBe("setItem")
-      expect(data.mutations[0].data.key).toBe("token")
+      expect(data.status).toBe("filtered_query_required")
+      expect(data.tool).toBe("query_storage")
+      expect(data.required).toContain("key")
     } finally {
       app.close()
     }
@@ -282,6 +325,9 @@ describe("tools", () => {
     expect(names).toContain("list_custom_commands")
     expect(names).toContain("show_overlay")
     expect(names).toContain("clear_timeline")
+    expect(names).toContain("query_logs")
+    expect(names).toContain("query_network")
+    expect(names).toContain("query_storage")
     expect(names).toContain("subscribe_state")
     expect(names).toContain("unsubscribe_state")
   })
@@ -525,6 +571,143 @@ describe("tools", () => {
       app.close()
     }
   })
+
+  test("query_logs filters by prefix, subprefix, keyword, and limit", async () => {
+    const app = await connectMockApp(relayPort)
+    try {
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "[JPush] Badge cleared successfully" } }))
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "[JPush] Registration ID updated successfully" } }))
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "[PreviewGateTiming] parentFirstFrameReady true" } }))
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "[PreviewGateTiming] finalGatePass true" } }))
+      await new Promise((r) => setTimeout(r, 100))
+
+      const res = await mcpRequest(mcpPort, {
+        jsonrpc: "2.0",
+        method: "tools/call",
+        id: 22,
+        params: {
+          name: "query_logs",
+          arguments: {
+            prefix: "PreviewGateTiming",
+            subprefix: "finalGatePass",
+            keyword: "true",
+            limit: 3,
+          },
+        },
+      })
+      const result = parseSSE(res.body)
+      const data = JSON.parse(result.result.content[0].text)
+      expect(data.status).toBe("success")
+      expect(data.count).toBe(1)
+      expect(data.events[0].prefix).toBe("PreviewGateTiming")
+      expect(data.events[0].subprefix).toBe("finalGatePass")
+      expect(data.events[0].message).toContain("finalGatePass")
+    } finally {
+      app.close()
+    }
+  })
+
+  test("query_network filters by url, method, and header", async () => {
+    const app = await connectMockApp(relayPort)
+    try {
+      app.send(JSON.stringify({
+        type: "api.response",
+        payload: {
+          duration: 50,
+          request: {
+            method: "GET",
+            url: "https://example.com/api/projects",
+            data: null,
+            headers: { Authorization: "Bearer abc" },
+            params: {},
+          },
+          response: {
+            status: 200,
+            body: "ok",
+            headers: { "x-request-id": "req-1" },
+          },
+        },
+      }))
+      app.send(JSON.stringify({
+        type: "api.response",
+        payload: {
+          duration: 20,
+          request: {
+            method: "POST",
+            url: "https://example.com/api/projects",
+            data: { name: "x" },
+            headers: { Authorization: "Bearer def" },
+            params: {},
+          },
+          response: {
+            status: 201,
+            body: "created",
+            headers: { "x-request-id": "req-2" },
+          },
+        },
+      }))
+      await new Promise((r) => setTimeout(r, 100))
+
+      const res = await mcpRequest(mcpPort, {
+        jsonrpc: "2.0",
+        method: "tools/call",
+        id: 23,
+        params: {
+          name: "query_network",
+          arguments: {
+            url: "/api/projects",
+            method: "POST",
+            header: { name: "authorization", value: "Bearer def" },
+            limit: 5,
+          },
+        },
+      })
+      const result = parseSSE(res.body)
+      const data = JSON.parse(result.result.content[0].text)
+      expect(data.status).toBe("success")
+      expect(data.count).toBe(1)
+      expect(data.entries[0].request.method).toBe("POST")
+      expect(data.entries[0].request.url).toContain("/api/projects")
+    } finally {
+      app.close()
+    }
+  })
+
+  test("query_storage filters by explicit key", async () => {
+    const app = await connectMockApp(relayPort)
+    try {
+      app.send(JSON.stringify({
+        type: "asyncStorage.mutation",
+        payload: { action: "setItem", data: { key: "token", value: "abc123" } },
+      }))
+      app.send(JSON.stringify({
+        type: "asyncStorage.mutation",
+        payload: { action: "setItem", data: { key: "profile", value: "alice" } },
+      }))
+      await new Promise((r) => setTimeout(r, 100))
+
+      const res = await mcpRequest(mcpPort, {
+        jsonrpc: "2.0",
+        method: "tools/call",
+        id: 24,
+        params: {
+          name: "query_storage",
+          arguments: {
+            key: "token",
+            limit: 3,
+          },
+        },
+      })
+      const result = parseSSE(res.body)
+      const data = JSON.parse(result.result.content[0].text)
+      expect(data.status).toBe("success")
+      expect(data.count).toBe(1)
+      expect(data.mutations[0].key).toBe("token")
+      expect(data.mutations[0].action).toBe("setItem")
+    } finally {
+      app.close()
+    }
+  })
 })
 
 describe("timeline summarization", () => {
@@ -551,7 +734,7 @@ describe("timeline summarization", () => {
       const data = JSON.parse(result.result.contents[0].text)
       const apiEvent = data.events.find((e: any) => e.type === "api.response")
       expect(apiEvent).toBeDefined()
-      expect(apiEvent.payloadPreview).toBe("GET /api/users -> 200 (100ms)")
+      expect(apiEvent.payloadPreview).toBe("[filtered network event — use query_network with url]")
       // Full payload should NOT be present
       expect(apiEvent.payload).toBeUndefined()
     } finally {
@@ -559,7 +742,7 @@ describe("timeline summarization", () => {
     }
   })
 
-  test("network resource returns summarized entries with truncated bodies", async () => {
+  test("network resource requires explicit url-based query", async () => {
     const app = await connectMockApp(relayPort)
     try {
       app.send(JSON.stringify({
@@ -580,29 +763,22 @@ describe("timeline summarization", () => {
       })
       const result = parseSSE(res.body)
       const data = JSON.parse(result.result.contents[0].text)
-      expect(data.entries.length).toBeGreaterThanOrEqual(1)
-      const entry = data.entries.find((e: any) => e.request.url === "/api/data")
-      expect(entry).toBeDefined()
-      expect(entry.request.method).toBe("POST")
-      expect(entry.response.status).toBe(201)
-      expect(entry.duration).toBe(50)
-      // Body should be truncated
-      expect(entry.response.body.length).toBeLessThanOrEqual(503)
+      expect(data.status).toBe("filtered_query_required")
+      expect(data.tool).toBe("query_network")
+      expect(data.required).toContain("url")
     } finally {
       app.close()
     }
   })
 
-  test("timeline_by_type resource template returns filtered events with full payloads", async () => {
+  test("timeline_by_type resource template returns filtered events with full payloads for non-guarded types", async () => {
     const app = await connectMockApp(relayPort)
     try {
-      app.send(JSON.stringify({ type: "log", payload: { message: "test log" } }))
       app.send(JSON.stringify({
-        type: "api.response",
+        type: "benchmark.report",
         payload: {
-          duration: 50,
-          request: { method: "GET", url: "/api/test", data: null, headers: {}, params: {} },
-          response: { status: 200, body: "ok", headers: {} },
+          title: "render benchmark",
+          steps: [{ title: "step-1", time: 12 }],
         },
       }))
       await new Promise((r) => setTimeout(r, 100))
@@ -611,16 +787,72 @@ describe("timeline summarization", () => {
         jsonrpc: "2.0",
         method: "resources/read",
         id: 32,
-        params: { uri: "reactotron://timeline/log" },
+        params: { uri: "reactotron://timeline/benchmark.report" },
       })
       const result = parseSSE(res.body)
       const data = JSON.parse(result.result.contents[0].text)
-      expect(data.type).toBe("log")
-      // Should only have log events (plus possibly other log events from connection)
-      expect(data.events.every((e: any) => e.type === "log")).toBe(true)
+      expect(data.type).toBe("benchmark.report")
+      expect(data.events.every((e: any) => e.type === "benchmark.report")).toBe(true)
       // Should have full payload, not just preview
-      const logEvent = data.events.find((e: any) => e.payload?.message === "test log")
-      expect(logEvent).toBeDefined()
+      const benchmarkEvent = data.events.find((e: any) => e.payload?.title === "render benchmark")
+      expect(benchmarkEvent).toBeDefined()
+    } finally {
+      app.close()
+    }
+  })
+
+  test("timeline_by_type blocks broad log, network, and storage reads", async () => {
+    const app = await connectMockApp(relayPort)
+    try {
+      app.send(JSON.stringify({ type: "log", payload: { message: "[JPush] test log" } }))
+      app.send(JSON.stringify({
+        type: "api.response",
+        payload: {
+          duration: 50,
+          request: { method: "GET", url: "/api/test", data: null, headers: {}, params: {} },
+          response: { status: 200, body: "ok", headers: {} },
+        },
+      }))
+      app.send(JSON.stringify({
+        type: "asyncStorage.mutation",
+        payload: {
+          action: "setItem",
+          data: { key: "auth-token", value: "secret" },
+        },
+      }))
+      await new Promise((r) => setTimeout(r, 100))
+
+      const checks = [
+        {
+          uri: "reactotron://timeline/log",
+          expectedTool: "query_logs",
+          expectedRequired: "prefix",
+        },
+        {
+          uri: "reactotron://timeline/api.response",
+          expectedTool: "query_network",
+          expectedRequired: "url",
+        },
+        {
+          uri: "reactotron://timeline/asyncStorage.mutation",
+          expectedTool: "query_storage",
+          expectedRequired: "key",
+        },
+      ]
+
+      for (const check of checks) {
+        const res = await mcpRequest(mcpPort, {
+          jsonrpc: "2.0",
+          method: "resources/read",
+          id: 3200,
+          params: { uri: check.uri },
+        })
+        const result = parseSSE(res.body)
+        const data = JSON.parse(result.result.contents[0].text)
+        expect(data.status).toBe("filtered_query_required")
+        expect(data.tool).toBe(check.expectedTool)
+        expect(data.required).toContain(check.expectedRequired)
+      }
     } finally {
       app.close()
     }

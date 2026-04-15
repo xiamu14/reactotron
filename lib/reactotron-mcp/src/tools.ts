@@ -7,6 +7,16 @@ import { extname } from "path"
 
 import { MAX_RESPONSE_CHARS, safeSerialize } from "./serialization"
 
+const timeRangeSchema = z.object({
+  start: z.string().optional().describe("Inclusive ISO timestamp start, e.g. '2026-04-15T08:00:00.000Z'"),
+  end: z.string().optional().describe("Inclusive ISO timestamp end, e.g. '2026-04-15T08:30:00.000Z'"),
+}).optional()
+
+const headerFilterSchema = z.object({
+  name: z.string().describe("Header name to match, e.g. 'authorization'"),
+  value: z.string().optional().describe("Optional header value substring to match"),
+})
+
 /** Extract width/height from PNG or JPEG buffer */
 function getImageSize(buf: Buffer, ext: string): { width: number; height: number } | null {
   try {
@@ -63,6 +73,159 @@ function resolveClientId(
 
 function textResult(data: unknown, guidance?: string) {
   return { content: [{ type: "text" as const, text: safeSerialize(data, MAX_RESPONSE_CHARS, guidance) }] }
+}
+
+function parseTimeRange(timeRange?: { start?: string; end?: string }):
+  | { start?: number; end?: number }
+  | { error: string } {
+  if (!timeRange) return {}
+
+  const start = timeRange.start ? Date.parse(timeRange.start) : null
+  if (timeRange.start && Number.isNaN(start)) {
+    return { error: `Invalid timeRange.start: ${timeRange.start}` }
+  }
+
+  const end = timeRange.end ? Date.parse(timeRange.end) : null
+  if (timeRange.end && Number.isNaN(end)) {
+    return { error: `Invalid timeRange.end: ${timeRange.end}` }
+  }
+
+  return { start, end }
+}
+
+function isWithinTimeRange(
+  command: Command,
+  timeRange?: { start?: string; end?: string }
+): { matches: boolean } | { error: string } {
+  const parsed = parseTimeRange(timeRange)
+  if ("error" in parsed) return parsed
+
+  const timestamp = new Date(command.date).getTime()
+  if (parsed.start != null && timestamp < parsed.start) return { matches: false }
+  if (parsed.end != null && timestamp > parsed.end) return { matches: false }
+  return { matches: true }
+}
+
+function normalizeToken(value: string) {
+  return value.trim().replace(/^\[|\]$/g, "")
+}
+
+function extractMessageText(message: unknown): string {
+  if (typeof message === "string") return message
+  if (Array.isArray(message)) {
+    return message.map((item) => extractMessageText(item)).join(" ")
+  }
+  if (message == null) return ""
+  try {
+    return JSON.stringify(message)
+  } catch {
+    return String(message)
+  }
+}
+
+function extractPrefixParts(message: string) {
+  let remaining = message.trim()
+  const bracketTokens: string[] = []
+
+  while (remaining.startsWith("[")) {
+    const match = remaining.match(/^\[([^\]]+)\]\s*/)
+    if (!match) break
+    bracketTokens.push(match[1])
+    remaining = remaining.slice(match[0].length)
+  }
+
+  const words = remaining.trim().split(/\s+/).filter(Boolean)
+  return {
+    prefix: bracketTokens[0] ?? null,
+    subprefix: bracketTokens[1] ?? words[0] ?? null,
+    remaining,
+  }
+}
+
+function matchesLogFilters(
+  command: Command,
+  {
+    prefix,
+    subprefix,
+    keyword,
+    timeRange,
+  }: {
+    prefix: string
+    subprefix?: string
+    keyword?: string
+    timeRange?: { start?: string; end?: string }
+  }
+) {
+  const timeCheck = isWithinTimeRange(command, timeRange)
+  if ("error" in timeCheck) return timeCheck
+  if (!timeCheck.matches) return { matches: false }
+
+  const messageText = extractMessageText((command.payload as any)?.message)
+  const parts = extractPrefixParts(messageText)
+  if (!parts.prefix || normalizeToken(parts.prefix).toLowerCase() !== normalizeToken(prefix).toLowerCase()) {
+    return { matches: false }
+  }
+
+  if (subprefix) {
+    const actualSubprefix = parts.subprefix ? normalizeToken(parts.subprefix).toLowerCase() : ""
+    const expectedSubprefix = normalizeToken(subprefix).toLowerCase()
+    if (actualSubprefix !== expectedSubprefix) {
+      return { matches: false }
+    }
+  }
+
+  if (keyword && !messageText.toLowerCase().includes(keyword.toLowerCase())) {
+    return { matches: false }
+  }
+
+  return {
+    matches: true,
+    entry: {
+      messageId: command.messageId,
+      clientId: command.clientId,
+      date: command.date,
+      level: (command.payload as any)?.level ?? "debug",
+      prefix: parts.prefix,
+      subprefix: parts.subprefix,
+      message: messageText,
+    },
+  }
+}
+
+function headerMatches(
+  command: Command,
+  header?: { name: string; value?: string }
+) {
+  if (!header) return true
+
+  const targetName = header.name.toLowerCase()
+  const targetValue = header.value?.toLowerCase()
+  const requestHeaders = ((command.payload as any)?.request?.headers ?? {}) as Record<string, string>
+  const responseHeaders = ((command.payload as any)?.response?.headers ?? {}) as Record<string, string>
+  const merged = [...Object.entries(requestHeaders), ...Object.entries(responseHeaders)]
+
+  return merged.some(([name, value]) => {
+    if (name.toLowerCase() !== targetName) return false
+    if (!targetValue) return true
+    return String(value ?? "").toLowerCase().includes(targetValue)
+  })
+}
+
+function extractStorageKeys(data: any): string[] {
+  if (!data) return []
+  if (typeof data.key === "string") return [data.key]
+  if (Array.isArray(data.keys)) return data.keys.filter((key): key is string => typeof key === "string")
+  if (Array.isArray(data.keyValueArray)) {
+    return data.keyValueArray
+      .map((entry) => Array.isArray(entry) ? entry[0] : null)
+      .filter((key): key is string => typeof key === "string")
+  }
+  if (Array.isArray(data)) {
+    return data
+      .map((entry) => Array.isArray(entry) ? entry[0] : null)
+      .filter((key): key is string => typeof key === "string")
+  }
+  return []
 }
 
 export function registerTools(
@@ -330,6 +493,181 @@ export function registerTools(
     const count = commandBuffer.length
     commandBuffer.length = 0
     return textResult({ status: "cleared", eventsRemoved: count })
+  })
+
+  mcp.registerTool("query_logs", {
+    description: [
+      "Read filtered log events from the current timeline buffer.",
+      "A prefix is required to avoid broad log dumps.",
+      "You can narrow further with subprefix, keyword, limit, and timeRange.",
+      "Returns newest-first.",
+    ].join(" "),
+    inputSchema: {
+      prefix: z.string().describe("Required log prefix without brackets, e.g. 'JPush' or 'PHASE-1'"),
+      subprefix: z.string().optional().describe("Optional subprefix, e.g. 'firstFrameRendered'"),
+      keyword: z.string().optional().describe("Optional keyword substring to match anywhere in the log message"),
+      limit: z.number().int().min(1).max(100).optional().describe("Maximum number of results to return, default 20"),
+      timeRange: timeRangeSchema.describe("Optional time range filter"),
+      clientId: z.string().optional().describe("Optional app clientId filter"),
+    },
+  }, async (args) => {
+    const limit = args.limit ?? 20
+    const relevantCommands = commandBuffer
+      .filter((command) => command.type === "log")
+      .filter((command) => !args.clientId || command.clientId === args.clientId)
+
+    const matched = []
+    for (const command of [...relevantCommands].reverse()) {
+      const result = matchesLogFilters(command, {
+        prefix: args.prefix,
+        subprefix: args.subprefix,
+        keyword: args.keyword,
+        timeRange: args.timeRange,
+      })
+      if ("error" in result) {
+        return textResult({ status: "error", message: result.error })
+      }
+      if (result.matches) {
+        matched.push(result.entry)
+      }
+      if (matched.length >= limit) break
+    }
+
+    return textResult({
+      status: "success",
+      filters: {
+        prefix: args.prefix,
+        subprefix: args.subprefix ?? null,
+        keyword: args.keyword ?? null,
+        limit,
+        timeRange: args.timeRange ?? null,
+        clientId: args.clientId ?? null,
+      },
+      count: matched.length,
+      events: matched,
+    })
+  })
+
+  mcp.registerTool("query_network", {
+    description: [
+      "Read filtered network entries from the current timeline buffer.",
+      "A URL substring is required.",
+      "You can narrow further with method, header, limit, and timeRange.",
+      "Returns newest-first.",
+    ].join(" "),
+    inputSchema: {
+      url: z.string().describe("Required URL substring to match, e.g. '/api/projects' or 'hugopia.yocdev.com'"),
+      method: z.string().optional().describe("Optional HTTP method filter, e.g. 'GET' or 'POST'"),
+      header: headerFilterSchema.optional().describe("Optional header filter"),
+      limit: z.number().int().min(1).max(100).optional().describe("Maximum number of results to return, default 20"),
+      timeRange: timeRangeSchema.describe("Optional time range filter"),
+      clientId: z.string().optional().describe("Optional app clientId filter"),
+    },
+  }, async (args) => {
+    const limit = args.limit ?? 20
+    const matched = []
+
+    for (const command of [...commandBuffer].reverse()) {
+      if (command.type !== "api.response") continue
+      if (args.clientId && command.clientId !== args.clientId) continue
+
+      const timeCheck = isWithinTimeRange(command, args.timeRange)
+      if ("error" in timeCheck) {
+        return textResult({ status: "error", message: timeCheck.error })
+      }
+      if (!timeCheck.matches) continue
+
+      const payload = command.payload as any
+      const requestUrl = String(payload?.request?.url ?? "")
+      if (!requestUrl.toLowerCase().includes(args.url.toLowerCase())) continue
+
+      if (args.method && String(payload?.request?.method ?? "").toLowerCase() !== args.method.toLowerCase()) {
+        continue
+      }
+
+      if (!headerMatches(command, args.header)) continue
+
+      matched.push({
+        messageId: command.messageId,
+        clientId: command.clientId,
+        date: command.date,
+        duration: payload?.duration,
+        request: payload?.request,
+        response: payload?.response,
+      })
+
+      if (matched.length >= limit) break
+    }
+
+    return textResult({
+      status: "success",
+      filters: {
+        url: args.url,
+        method: args.method ?? null,
+        header: args.header ?? null,
+        limit,
+        timeRange: args.timeRange ?? null,
+        clientId: args.clientId ?? null,
+      },
+      count: matched.length,
+      entries: matched,
+    }, "Network results are too large. Narrow further with a more specific URL, header, or smaller time range.")
+  })
+
+  mcp.registerTool("query_storage", {
+    description: [
+      "Read filtered AsyncStorage mutation events from the current timeline buffer.",
+      "A storage key is required.",
+      "You can narrow with limit and timeRange.",
+      "Returns newest-first.",
+    ].join(" "),
+    inputSchema: {
+      key: z.string().describe("Required storage key to match exactly"),
+      limit: z.number().int().min(1).max(100).optional().describe("Maximum number of results to return, default 20"),
+      timeRange: timeRangeSchema.describe("Optional time range filter"),
+      clientId: z.string().optional().describe("Optional app clientId filter"),
+    },
+  }, async (args) => {
+    const limit = args.limit ?? 20
+    const matched = []
+
+    for (const command of [...commandBuffer].reverse()) {
+      if (command.type !== "asyncStorage.mutation") continue
+      if (args.clientId && command.clientId !== args.clientId) continue
+
+      const timeCheck = isWithinTimeRange(command, args.timeRange)
+      if ("error" in timeCheck) {
+        return textResult({ status: "error", message: timeCheck.error })
+      }
+      if (!timeCheck.matches) continue
+
+      const payload = command.payload as any
+      const keys = extractStorageKeys(payload?.data)
+      if (!keys.includes(args.key)) continue
+
+      matched.push({
+        messageId: command.messageId,
+        clientId: command.clientId,
+        date: command.date,
+        action: payload?.action,
+        key: args.key,
+        data: payload?.data,
+      })
+
+      if (matched.length >= limit) break
+    }
+
+    return textResult({
+      status: "success",
+      filters: {
+        key: args.key,
+        limit,
+        timeRange: args.timeRange ?? null,
+        clientId: args.clientId ?? null,
+      },
+      count: matched.length,
+      mutations: matched,
+    }, "Storage results are too large. Narrow the time range or lower the limit.")
   })
 
   mcp.registerTool("subscribe_state", {

@@ -1,3 +1,4 @@
+import fs from "fs"
 import { app, BrowserWindow } from "electron"
 import path from "path"
 import { format as formatUrl } from "url"
@@ -14,11 +15,44 @@ class AppUpdater {
   constructor() {
     log.transports.file.level = "debug"
     autoUpdater.logger = log
-    autoUpdater.checkForUpdatesAndNotify()
+
+    if (!app.isPackaged) {
+      return
+    }
+
+    autoUpdater.checkForUpdatesAndNotify().catch((error) => {
+      log.warn("Auto update check failed", error)
+    })
   }
 }
 
 let mainWindow: BrowserWindow | null
+
+function resolveExistingPath(candidates: string[]) {
+  return candidates.find((candidate) => fs.existsSync(candidate))
+}
+
+function resolvePackagedAppIconPath() {
+  const candidates = [
+    path.resolve(app.getAppPath(), "icon.icns"),
+    path.resolve(app.getAppPath(), "..", "icon.icns"),
+    path.resolve(__dirname, "../../icon.icns"),
+    path.resolve(process.cwd(), "apps/reactotron-app/icon.icns"),
+  ]
+
+  return resolveExistingPath(candidates)
+}
+
+function resolveRuntimeIconPath() {
+  const candidates = [
+    path.resolve(app.getAppPath(), "icon.png"),
+    path.resolve(app.getAppPath(), "..", "icon.png"),
+    path.resolve(__dirname, "../../icon.png"),
+    path.resolve(process.cwd(), "apps/reactotron-app/icon.png"),
+  ]
+
+  return resolveExistingPath(candidates)
+}
 
 function createMainWindow() {
   const mainWindowState = windowStateKeeper({
@@ -26,6 +60,12 @@ function createMainWindow() {
     defaultWidth: 650,
     defaultHeight: 800,
   })
+  const packagedIcon = resolvePackagedAppIconPath()
+  const runtimeIcon = resolveRuntimeIconPath()
+
+  if (process.platform === "darwin" && runtimeIcon) {
+    app.dock.setIcon(runtimeIcon)
+  }
 
   const window = new BrowserWindow({
     title: "Reactotron",
@@ -36,6 +76,7 @@ function createMainWindow() {
     minWidth: 800,
     minHeight: 700,
     titleBarStyle: "hiddenInset",
+    ...(packagedIcon && process.platform !== "darwin" ? { icon: packagedIcon } : {}),
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,

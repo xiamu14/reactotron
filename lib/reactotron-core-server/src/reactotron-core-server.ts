@@ -228,6 +228,7 @@ export default class Server {
 
       // when we receive a command from the client
       socket.on("message", (incoming: RawData) => {
+        console.log("[relay] raw", incoming.toString().slice(0, 300))
         const message = JSON.parse(incoming.toString())
         repair(message)
         const { type, important, payload, deltaTime = 0, diff } = message

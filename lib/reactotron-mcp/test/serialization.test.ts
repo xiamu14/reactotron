@@ -107,7 +107,7 @@ describe("summarizeCommand", () => {
       },
     })
     const summary = summarizeCommand(cmd) as any
-    expect(summary.payloadPreview).toBe("GET /api/users -> 200 (145ms)")
+    expect(summary.payloadPreview).toBe("[filtered network event — use query_network with url]")
   })
 
   test("produces preview for log events", () => {
@@ -116,7 +116,16 @@ describe("summarizeCommand", () => {
       payload: { level: "error", message: "Something went wrong" },
     })
     const summary = summarizeCommand(cmd) as any
-    expect(summary.payloadPreview).toBe("[error] Something went wrong")
+    expect(summary.payloadPreview).toBe("[filtered log event — use query_logs with prefix]")
+  })
+
+  test("produces preview for asyncStorage.mutation events", () => {
+    const cmd = makeCommand({
+      type: "asyncStorage.mutation" as any,
+      payload: { action: "setItem", data: { key: "token", value: "abc123" } },
+    })
+    const summary = summarizeCommand(cmd) as any
+    expect(summary.payloadPreview).toBe("[filtered storage event — use query_storage with key]")
   })
 
   test("produces preview for state.values.response", () => {

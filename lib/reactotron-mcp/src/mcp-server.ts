@@ -18,11 +18,55 @@ export function createMcpServer(reactotronServer: ReactotronServer): ReactotronM
   let httpServer: HttpServer | null = null
   let started = false
   let listenPort: number | null = null
+  const knownApps = new Map<string, {
+    id: number
+    clientId: string
+    name: string
+    platform: string
+    platformVersion?: string
+    connected: boolean
+    lastSeenAt?: string
+  }>()
 
   // Command buffer — collects recent commands for resource reads
   const commandBuffer: Command[] = []
   const BUFFER_SIZE = 500
   let commandListener: ((command: Command) => void) | null = null
+  let connectionEstablishedListener: ((connection: any) => void) | null = null
+  let disconnectListener: ((connection: any) => void) | null = null
+
+  function snapshotApps() {
+    const liveApps = (reactotronServer.connections as any[]).map((connection) => ({
+      id: connection.id,
+      clientId: connection.clientId,
+      name: connection.name,
+      platform: connection.platform,
+      platformVersion: connection.platformVersion,
+      connected: true,
+      lastSeenAt: new Date().toISOString(),
+    }))
+
+    liveApps.forEach((app) => {
+      knownApps.set(app.clientId, app)
+    })
+
+    console.log("[reactotron-mcp] snapshotApps", JSON.stringify({
+      liveCount: liveApps.length,
+      liveApps: liveApps.map((app) => ({
+        name: app.name,
+        clientId: app.clientId,
+        connected: app.connected,
+      })),
+      knownCount: knownApps.size,
+      knownApps: Array.from(knownApps.values()).map((app) => ({
+        name: app.name,
+        clientId: app.clientId,
+        connected: app.connected,
+      })),
+    }))
+
+    return liveApps.length > 0 ? liveApps : Array.from(knownApps.values())
+  }
 
   function startBuffering() {
     commandListener = (command: Command) => {
@@ -32,6 +76,44 @@ export function createMcpServer(reactotronServer: ReactotronServer): ReactotronM
       }
     }
     reactotronServer.on("command", commandListener as any)
+
+    connectionEstablishedListener = (connection: any) => {
+      console.log("[reactotron-mcp] connectionEstablished", JSON.stringify({
+        name: connection.name,
+        clientId: connection.clientId,
+        platform: connection.platform,
+      }))
+      knownApps.set(connection.clientId, {
+        id: connection.id,
+        clientId: connection.clientId,
+        name: connection.name,
+        platform: connection.platform,
+        platformVersion: connection.platformVersion,
+        connected: true,
+        lastSeenAt: new Date().toISOString(),
+      })
+    }
+    reactotronServer.on("connectionEstablished", connectionEstablishedListener as any)
+
+    disconnectListener = (connection: any) => {
+      console.log("[reactotron-mcp] disconnect", JSON.stringify({
+        name: connection.name,
+        clientId: connection.clientId,
+        platform: connection.platform,
+      }))
+      const previous = knownApps.get(connection.clientId)
+      knownApps.set(connection.clientId, {
+        ...previous,
+        id: connection.id,
+        clientId: connection.clientId,
+        name: connection.name,
+        platform: connection.platform,
+        platformVersion: connection.platformVersion,
+        connected: false,
+        lastSeenAt: new Date().toISOString(),
+      })
+    }
+    reactotronServer.on("disconnect", disconnectListener as any)
   }
 
   function stopBuffering() {
@@ -39,7 +121,16 @@ export function createMcpServer(reactotronServer: ReactotronServer): ReactotronM
       reactotronServer.off("command", commandListener as any)
       commandListener = null
     }
+    if (connectionEstablishedListener) {
+      reactotronServer.off("connectionEstablished", connectionEstablishedListener as any)
+      connectionEstablishedListener = null
+    }
+    if (disconnectListener) {
+      reactotronServer.off("disconnect", disconnectListener as any)
+      disconnectListener = null
+    }
     commandBuffer.length = 0
+    knownApps.clear()
   }
 
   /** Create a fresh McpServer instance with all resources/tools registered */
@@ -48,9 +139,38 @@ export function createMcpServer(reactotronServer: ReactotronServer): ReactotronM
       { name: "reactotron", version: "0.1.0" },
       { capabilities: { resources: {}, tools: {} } }
     )
-    registerResources(mcp, reactotronServer, commandBuffer)
+    registerResources(mcp, reactotronServer, commandBuffer, snapshotApps)
     registerTools(mcp, reactotronServer, commandBuffer)
     return mcp
+  }
+
+  function ensureAcceptHeader(req: import("http").IncomingMessage) {
+    const acceptHeader = req.headers.accept ?? ""
+    const acceptsJson = acceptHeader.includes("application/json")
+    const acceptsEventStream = acceptHeader.includes("text/event-stream")
+
+    if (acceptsJson && acceptsEventStream) {
+      return
+    }
+
+    const normalizedAccept = "application/json, text/event-stream"
+    req.headers.accept = normalizedAccept
+
+    const rawHeaders = [...(req.rawHeaders ?? [])]
+    let replaced = false
+
+    for (let i = 0; i < rawHeaders.length; i += 2) {
+      if (rawHeaders[i]?.toLowerCase() === "accept") {
+        rawHeaders[i + 1] = normalizedAccept
+        replaced = true
+      }
+    }
+
+    if (!replaced) {
+      rawHeaders.push("Accept", normalizedAccept)
+    }
+
+    req.rawHeaders = rawHeaders
   }
 
   return {
@@ -75,6 +195,17 @@ export function createMcpServer(reactotronServer: ReactotronServer): ReactotronM
         const url = new URL(req.url ?? "/", `http://${req.headers.host}`)
 
         if (url.pathname === "/mcp" && req.method === "POST") {
+          ensureAcceptHeader(req)
+
+          console.log("[reactotron-mcp] request", JSON.stringify({
+            path: url.pathname,
+            method: req.method,
+            liveConnections: (reactotronServer.connections as any[]).map((connection) => ({
+              name: connection.name,
+              clientId: connection.clientId,
+            })),
+            commandBufferSize: commandBuffer.length,
+          }))
           // Stateless: new server + transport per request
           const mcp = createMcp()
           const transport = new StreamableHTTPServerTransport({

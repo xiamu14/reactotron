@@ -1,4 +1,4 @@
-import { useCallback, useReducer } from "react"
+import { useCallback, useEffect, useReducer, useRef } from "react"
 import { produce } from "immer"
 
 export enum ActionTypes {
@@ -188,6 +188,11 @@ function useStandalone() {
     orphanedCommands: [],
     commandListeners: [],
   })
+  const commandListenersRef = useRef(state.commandListeners)
+
+  useEffect(() => {
+    commandListenersRef.current = state.commandListeners
+  }, [state.commandListeners])
 
   // Called when the server successfully starts
   const serverStarted = useCallback(() => {
@@ -214,9 +219,9 @@ function useStandalone() {
       dispatch({ type: ActionTypes.CommandReceived, payload: command })
 
       // Then notify listeners
-      state.commandListeners.forEach((cl) => cl(command))
+      commandListenersRef.current.forEach((cl) => cl(command))
     },
-    [state.commandListeners]
+    []
   )
 
   // Called when a client disconnects. NOTE: They could be coming back. This could happen with a reload of the simulator!

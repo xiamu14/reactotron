@@ -89,29 +89,51 @@ const Provider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     }
   }, [])
 
-  const toggleMcp = useCallback(() => {
-    if (!reactotronServer.current) return
-
-    if (mcpStatus === "started") {
-      if (mcpServerRef.current) {
-        mcpServerRef.current.stop()
-        mcpServerRef.current = null
-      }
-      setMcpStatus("stopped")
-      setMcpPort(null)
-    } else {
-      const port = config.get("mcpPort") as number
-      const mcp = createMcpServer(reactotronServer.current)
-      mcp.start(port).then(() => {
-        mcpServerRef.current = mcp
-        setMcpStatus("started")
-        setMcpPort(port)
-      }).catch(() => {
-        setMcpStatus("error")
-        setMcpPort(null)
-      })
+  const stopMcp = useCallback(() => {
+    if (mcpServerRef.current) {
+      mcpServerRef.current.stop()
+      mcpServerRef.current = null
     }
-  }, [mcpStatus])
+    setMcpStatus("stopped")
+    setMcpPort(null)
+  }, [])
+
+  const startMcp = useCallback(() => {
+    if (!reactotronServer.current) return Promise.resolve()
+
+    const port = config.get("mcpPort") as number
+    const mcp = createMcpServer(reactotronServer.current)
+
+    return mcp.start(port).then(() => {
+      mcpServerRef.current = mcp
+      setMcpStatus("started")
+      setMcpPort(port)
+    }).catch(() => {
+      setMcpStatus("error")
+      setMcpPort(null)
+    })
+  }, [])
+
+  const toggleMcp = useCallback(() => {
+    if (mcpStatus === "started") {
+      stopMcp()
+      return
+    }
+
+    void startMcp()
+  }, [mcpStatus, startMcp, stopMcp])
+
+  useEffect(() => {
+    if (process.env.REACTOTRON_AUTO_START_MCP !== "1") {
+      return
+    }
+
+    if (mcpStatus !== "stopped") {
+      return
+    }
+
+    void startMcp()
+  }, [mcpStatus, startMcp])
 
   const sendCommand = useCallback(
     (type: string, payload: any, clientId?: string) => {

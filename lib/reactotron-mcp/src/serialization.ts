@@ -36,25 +36,6 @@ export function safeSerialize(
   return truncate(text, limit, guidance)
 }
 
-/** One-line preview of an api.response command payload. */
-function apiResponsePreview(payload: any): string {
-  const method = payload?.request?.method ?? "?"
-  const url = payload?.request?.url ?? "?"
-  const status = payload?.response?.status ?? "?"
-  const duration = payload?.duration != null ? ` (${payload.duration}ms)` : ""
-  return `${method} ${url} -> ${status}${duration}`
-}
-
-/** One-line preview of a log command payload. */
-function logPreview(payload: any): string {
-  const level = payload?.level ?? "log"
-  let msg = typeof payload?.message === "string" ? payload.message : compactJson(payload?.message)
-  if (msg.length > MAX_PAYLOAD_PREVIEW_CHARS) {
-    msg = msg.slice(0, MAX_PAYLOAD_PREVIEW_CHARS) + "..."
-  }
-  return `[${level}] ${msg}`
-}
-
 /** Generic short preview of a payload. */
 function genericPreview(payload: any): string {
   if (payload == null) return ""
@@ -71,10 +52,13 @@ export function summarizeCommand(cmd: Command): object {
   let preview: string
   switch (cmd.type) {
     case "api.response":
-      preview = apiResponsePreview(cmd.payload)
+      preview = "[filtered network event — use query_network with url]"
       break
     case "log":
-      preview = logPreview(cmd.payload)
+      preview = "[filtered log event — use query_logs with prefix]"
+      break
+    case "asyncStorage.mutation":
+      preview = "[filtered storage event — use query_storage with key]"
       break
     case "state.values.response":
       preview = `path: ${(cmd.payload as any)?.path ?? "(root)"}`

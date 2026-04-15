@@ -333,5 +333,16 @@ describe("contexts/Standalone/useStandalone", () => {
 
       expect(mockListener).toHaveBeenCalledWith({ clientId: "1234", payload: true })
     })
+
+    it("should keep commandReceived stable when listeners change", () => {
+      const { result } = renderHook(() => useStandalone())
+      const firstCommandReceived = result.current.commandReceived
+
+      act(() => {
+        result.current.addCommandListener(jest.fn())
+      })
+
+      expect(result.current.commandReceived).toBe(firstCommandReceived)
+    })
   })
 })
