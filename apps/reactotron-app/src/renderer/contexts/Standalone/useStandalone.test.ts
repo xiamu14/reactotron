@@ -311,6 +311,68 @@ describe("contexts/Standalone/useStandalone", () => {
       expect(result.current.connections[0].commands.length).toEqual(0)
     })
 
+    it("should clear commands from a specific connection", () => {
+      const { result } = renderHook(() => useStandalone())
+
+      act(() => {
+        result.current.connectionEstablished({
+          clientId: "1234",
+          id: 0,
+          platform: "ios",
+        })
+        result.current.connectionEstablished({
+          clientId: "5678",
+          id: 1,
+          platform: "android",
+        })
+      })
+
+      act(() => {
+        result.current.commandReceived({ clientId: "1234", payload: "first" })
+        result.current.commandReceived({ clientId: "5678", payload: "second" })
+      })
+
+      act(() => {
+        result.current.clearSelectedConnectionCommands("5678")
+      })
+
+      expect(result.current.connections.find((c) => c.clientId === "1234")?.commands).toEqual([
+        { clientId: "1234", payload: "first" },
+      ])
+      expect(result.current.connections.find((c) => c.clientId === "5678")?.commands).toEqual([])
+    })
+
+    it("should clear commands from all connections", () => {
+      const { result } = renderHook(() => useStandalone())
+
+      act(() => {
+        result.current.connectionEstablished({
+          clientId: "1234",
+          id: 0,
+          platform: "ios",
+        })
+        result.current.connectionEstablished({
+          clientId: "5678",
+          id: 1,
+          platform: "android",
+        })
+      })
+
+      act(() => {
+        result.current.commandReceived({ connectionId: 99, payload: "orphan" })
+        result.current.commandReceived({ clientId: "1234", payload: "first" })
+        result.current.commandReceived({ clientId: "5678", payload: "second" })
+      })
+
+      act(() => {
+        result.current.clearAllConnectionCommands()
+      })
+
+      expect(result.current.orphanedCommands).toEqual([])
+      expect(result.current.connections.find((c) => c.clientId === "1234")?.commands).toEqual([])
+      expect(result.current.connections.find((c) => c.clientId === "5678")?.commands).toEqual([])
+    })
+
     it("should add a command received listener and it should be called when a command is received", () => {
       const { result } = renderHook(() => useStandalone())
       const mockListener = jest.fn()

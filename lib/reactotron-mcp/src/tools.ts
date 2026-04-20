@@ -123,7 +123,7 @@ function extractMessageText(message: unknown): string {
   }
 }
 
-function extractPrefixParts(message: string) {
+export function extractPrefixParts(message: string) {
   let remaining = message.trim()
   const bracketTokens: string[] = []
 
@@ -136,8 +136,10 @@ function extractPrefixParts(message: string) {
 
   const words = remaining.trim().split(/\s+/).filter(Boolean)
   return {
-    prefix: bracketTokens[0] ?? null,
-    subprefix: bracketTokens[1] ?? words[0] ?? null,
+    prefix: bracketTokens[0] ?? words[0] ?? null,
+    subprefix: bracketTokens[0]
+      ? bracketTokens[1] ?? words[0] ?? null
+      : words[1] ?? null,
     remaining,
   }
 }
@@ -148,11 +150,13 @@ function matchesLogFilters(
     prefix,
     subprefix,
     keyword,
+    excludeKeyword,
     timeRange,
   }: {
     prefix: string
     subprefix?: string
     keyword?: string
+    excludeKeyword?: string
     timeRange?: { start?: string; end?: string }
   }
 ) {
@@ -174,7 +178,13 @@ function matchesLogFilters(
     }
   }
 
-  if (keyword && !messageText.toLowerCase().includes(keyword.toLowerCase())) {
+  const normalizedMessageText = messageText.toLowerCase()
+
+  if (keyword && !normalizedMessageText.includes(keyword.toLowerCase())) {
+    return { matches: false }
+  }
+
+  if (excludeKeyword && normalizedMessageText.includes(excludeKeyword.toLowerCase())) {
     return { matches: false }
   }
 
@@ -231,8 +241,14 @@ function extractStorageKeys(data: any): string[] {
 export function registerTools(
   mcp: McpServer,
   server: ReactotronServer,
-  commandBuffer: Command[]
+  commandBuffer: Command[],
+  options: {
+    clearTimeline?: (clientId?: string) => void
+    getCommands?: () => Command[]
+  } = {}
 ) {
+  const currentCommands = () => options.getCommands?.() ?? commandBuffer
+
   mcp.registerTool("dispatch_action", {
     description: [
       "Dispatch a Redux action to the connected app.",
@@ -487,32 +503,60 @@ export function registerTools(
   })
 
   mcp.registerTool("clear_timeline", {
-    description: "Clear the MCP event buffer. This only affects what you see via MCP resources — the Reactotron desktop app's timeline is not affected. Useful to discard old events and focus on what happens next.",
-    inputSchema: {},
-  }, async () => {
-    const count = commandBuffer.length
-    commandBuffer.length = 0
-    return textResult({ status: "cleared", eventsRemoved: count })
+    description: "Clear the current Reactotron timeline and the MCP event buffer. Optionally pass clientId to clear a single app; omit it to clear everything.",
+    inputSchema: {
+      clientId: z.string().optional().describe("Optional app clientId filter. Omit to clear all apps from both MCP and the desktop timeline."),
+    },
+  }, async (args) => {
+    let removed = 0
+
+    if (args.clientId) {
+      for (let i = commandBuffer.length - 1; i >= 0; i--) {
+        if (commandBuffer[i]?.clientId === args.clientId) {
+          commandBuffer.splice(i, 1)
+          removed++
+        }
+      }
+    } else {
+      removed = commandBuffer.length
+      commandBuffer.length = 0
+    }
+
+    if (options.getCommands) {
+      removed = args.clientId
+        ? currentCommands().filter((command) => command.clientId === args.clientId).length
+        : currentCommands().length
+    }
+
+    options.clearTimeline?.(args.clientId)
+
+    return textResult({
+      status: "cleared",
+      eventsRemoved: removed,
+      clientId: args.clientId ?? null,
+      target: args.clientId ? "client" : "all",
+    })
   })
 
   mcp.registerTool("query_logs", {
     description: [
       "Read filtered log events from the current timeline buffer.",
       "A prefix is required to avoid broad log dumps.",
-      "You can narrow further with subprefix, keyword, limit, and timeRange.",
+      "You can narrow further with subprefix, keyword, excludeKeyword, limit, and timeRange.",
       "Returns newest-first.",
     ].join(" "),
     inputSchema: {
       prefix: z.string().describe("Required log prefix without brackets, e.g. 'JPush' or 'PHASE-1'"),
       subprefix: z.string().optional().describe("Optional subprefix, e.g. 'firstFrameRendered'"),
       keyword: z.string().optional().describe("Optional keyword substring to match anywhere in the log message"),
+      excludeKeyword: z.string().optional().describe("Optional keyword substring to exclude anywhere in the log message"),
       limit: z.number().int().min(1).max(100).optional().describe("Maximum number of results to return, default 20"),
       timeRange: timeRangeSchema.describe("Optional time range filter"),
       clientId: z.string().optional().describe("Optional app clientId filter"),
     },
   }, async (args) => {
     const limit = args.limit ?? 20
-    const relevantCommands = commandBuffer
+    const relevantCommands = currentCommands()
       .filter((command) => command.type === "log")
       .filter((command) => !args.clientId || command.clientId === args.clientId)
 
@@ -522,6 +566,7 @@ export function registerTools(
         prefix: args.prefix,
         subprefix: args.subprefix,
         keyword: args.keyword,
+        excludeKeyword: args.excludeKeyword,
         timeRange: args.timeRange,
       })
       if ("error" in result) {
@@ -539,6 +584,7 @@ export function registerTools(
         prefix: args.prefix,
         subprefix: args.subprefix ?? null,
         keyword: args.keyword ?? null,
+        excludeKeyword: args.excludeKeyword ?? null,
         limit,
         timeRange: args.timeRange ?? null,
         clientId: args.clientId ?? null,
@@ -567,7 +613,7 @@ export function registerTools(
     const limit = args.limit ?? 20
     const matched = []
 
-    for (const command of [...commandBuffer].reverse()) {
+    for (const command of [...currentCommands()].reverse()) {
       if (command.type !== "api.response") continue
       if (args.clientId && command.clientId !== args.clientId) continue
 
@@ -631,7 +677,7 @@ export function registerTools(
     const limit = args.limit ?? 20
     const matched = []
 
-    for (const command of [...commandBuffer].reverse()) {
+    for (const command of [...currentCommands()].reverse()) {
       if (command.type !== "asyncStorage.mutation") continue
       if (args.clientId && command.clientId !== args.clientId) continue
 

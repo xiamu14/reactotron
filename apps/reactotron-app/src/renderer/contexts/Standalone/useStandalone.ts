@@ -7,6 +7,7 @@ export enum ActionTypes {
   AddConnection = "ADD_CONNECTION",
   RemoveConnection = "REMOVE_CONNECTION",
   ClearConnectionCommands = "CLEAR_CONNECTION_COMMANDS",
+  ClearAllConnectionCommands = "CLEAR_ALL_CONNECTION_COMMANDS",
   CommandReceived = "COMMAND_RECEIVED",
   ChangeSelectedClientId = "CHANGE_SELECTED_CLIENT_ID",
   AddCommandHandler = "ADD_COMMAND_HANDLER",
@@ -51,7 +52,8 @@ type Action =
     }
   | { type: ActionTypes.ChangeSelectedClientId; payload: string }
   | { type: ActionTypes.CommandReceived; payload: any } // TODO: Type this better!
-  | { type: ActionTypes.ClearConnectionCommands }
+  | { type: ActionTypes.ClearConnectionCommands; payload?: string }
+  | { type: ActionTypes.ClearAllConnectionCommands }
   | { type: ActionTypes.AddCommandHandler; payload: (command: any) => void }
   | { type: ActionTypes.PortUnavailable; payload: undefined }
 
@@ -148,15 +150,23 @@ export function reducer(state: State, action: Action) {
       })
     case ActionTypes.ClearConnectionCommands:
       return produce(state, (draftState) => {
-        if (!draftState.selectedClientId) return
+        const targetClientId = action.payload ?? draftState.selectedClientId
+        if (!targetClientId) return
 
         const selectedConnection = draftState.connections.find(
-          (c) => c.clientId === draftState.selectedClientId
+          (c) => c.clientId === targetClientId
         )
 
         if (!selectedConnection) return
 
         selectedConnection.commands = []
+      })
+    case ActionTypes.ClearAllConnectionCommands:
+      return produce(state, (draftState) => {
+        draftState.connections.forEach((connection) => {
+          connection.commands = []
+        })
+        draftState.orphanedCommands = []
       })
     case ActionTypes.ChangeSelectedClientId:
       return produce(state, (draftState) => {
@@ -229,8 +239,12 @@ function useStandalone() {
     dispatch({ type: ActionTypes.RemoveConnection, payload: connection })
   }, [])
 
-  const clearSelectedConnectionCommands = useCallback(() => {
-    dispatch({ type: ActionTypes.ClearConnectionCommands })
+  const clearSelectedConnectionCommands = useCallback((clientId?: string) => {
+    dispatch({ type: ActionTypes.ClearConnectionCommands, payload: clientId })
+  }, [])
+
+  const clearAllConnectionCommands = useCallback(() => {
+    dispatch({ type: ActionTypes.ClearAllConnectionCommands })
   }, [])
 
   const selectConnection = useCallback((clientId: string) => {
@@ -255,6 +269,7 @@ function useStandalone() {
     connectionDisconnected,
     commandReceived,
     clearSelectedConnectionCommands,
+    clearAllConnectionCommands,
     addCommandListener,
     portUnavailable,
   }

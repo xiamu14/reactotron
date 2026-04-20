@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useCallback, useState } from "react"
 import Server, { createServer } from "reactotron-core-server"
+import type { Command } from "reactotron-core-contract"
 import { createMcpServer, type ReactotronMcpServer } from "reactotron-mcp"
 
 import ReactotronBrain from "../../ReactotronBrain"
@@ -40,6 +41,7 @@ const Provider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     selectedConnection,
     selectConnection,
     clearSelectedConnectionCommands,
+    clearAllConnectionCommands,
     serverStarted,
     serverStopped,
     connectionEstablished,
@@ -78,6 +80,11 @@ const Provider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const mcpServerRef = useRef<ReactotronMcpServer>(null)
   const [mcpStatus, setMcpStatus] = useState<McpStatus>("stopped")
   const [mcpPort, setMcpPort] = useState<number | null>(null)
+  const connectionsRef = useRef(connections)
+
+  useEffect(() => {
+    connectionsRef.current = connections
+  }, [connections])
 
   // Clean up MCP server on unmount
   useEffect(() => {
@@ -102,7 +109,29 @@ const Provider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     if (!reactotronServer.current) return Promise.resolve()
 
     const port = config.get("mcpPort") as number
-    const mcp = createMcpServer(reactotronServer.current)
+    const mcp = createMcpServer(reactotronServer.current, {
+      clearTimeline: (clientId?: string) => {
+        if (clientId) {
+          clearSelectedConnectionCommands(clientId)
+          return
+        }
+        clearAllConnectionCommands()
+      },
+      getCommands: () =>
+        connectionsRef.current
+          .flatMap((connection) => connection.commands as Command[])
+          .slice()
+          .sort((left, right) => {
+            const leftMessageId = typeof left?.messageId === "number" ? left.messageId : -1
+            const rightMessageId = typeof right?.messageId === "number" ? right.messageId : -1
+
+            if (leftMessageId !== rightMessageId) {
+              return leftMessageId - rightMessageId
+            }
+
+            return new Date(left.date).getTime() - new Date(right.date).getTime()
+          }),
+    })
 
     return mcp.start(port).then(() => {
       mcpServerRef.current = mcp
@@ -112,7 +141,7 @@ const Provider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
       setMcpStatus("error")
       setMcpPort(null)
     })
-  }, [])
+  }, [clearAllConnectionCommands, clearSelectedConnectionCommands])
 
   const toggleMcp = useCallback(() => {
     if (mcpStatus === "started") {

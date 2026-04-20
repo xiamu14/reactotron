@@ -14,7 +14,15 @@ export interface ReactotronMcpServer {
   readonly port: number | null
 }
 
-export function createMcpServer(reactotronServer: ReactotronServer): ReactotronMcpServer {
+interface CreateMcpServerOptions {
+  clearTimeline?: (clientId?: string) => void
+  getCommands?: () => Command[]
+}
+
+export function createMcpServer(
+  reactotronServer: ReactotronServer,
+  options: CreateMcpServerOptions = {}
+): ReactotronMcpServer {
   let httpServer: HttpServer | null = null
   let started = false
   let listenPort: number | null = null
@@ -139,8 +147,8 @@ export function createMcpServer(reactotronServer: ReactotronServer): ReactotronM
       { name: "reactotron", version: "0.1.0" },
       { capabilities: { resources: {}, tools: {} } }
     )
-    registerResources(mcp, reactotronServer, commandBuffer, snapshotApps)
-    registerTools(mcp, reactotronServer, commandBuffer)
+    registerResources(mcp, reactotronServer, commandBuffer, options.getCommands, snapshotApps)
+    registerTools(mcp, reactotronServer, commandBuffer, options)
     return mcp
   }
 

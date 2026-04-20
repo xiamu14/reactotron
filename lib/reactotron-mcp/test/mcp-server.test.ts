@@ -572,7 +572,7 @@ describe("tools", () => {
     }
   })
 
-  test("query_logs filters by prefix, subprefix, keyword, and limit", async () => {
+  test("query_logs filters by prefix, subprefix, keyword, excludeKeyword, and limit", async () => {
     const app = await connectMockApp(relayPort)
     try {
       app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "[JPush] Badge cleared successfully" } }))
@@ -602,6 +602,105 @@ describe("tools", () => {
       expect(data.events[0].prefix).toBe("PreviewGateTiming")
       expect(data.events[0].subprefix).toBe("finalGatePass")
       expect(data.events[0].message).toContain("finalGatePass")
+      expect(data.filters.excludeKeyword).toBeNull()
+    } finally {
+      app.close()
+    }
+  })
+
+  test("query_logs matches plain-text prefixes without brackets", async () => {
+    const app = await connectMockApp(relayPort)
+    try {
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "isPreviewReady 00:01 waiting" } }))
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "isPreviewReady 00:02 ready" } }))
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "otherPrefix 00:03 ignored" } }))
+      await new Promise((r) => setTimeout(r, 100))
+
+      const res = await mcpRequest(mcpPort, {
+        jsonrpc: "2.0",
+        method: "tools/call",
+        id: 22_1,
+        params: {
+          name: "query_logs",
+          arguments: {
+            prefix: "isPreviewReady",
+            keyword: "00:",
+            limit: 5,
+          },
+        },
+      })
+      const result = parseSSE(res.body)
+      const data = JSON.parse(result.result.content[0].text)
+      expect(data.status).toBe("success")
+      expect(data.count).toBe(2)
+      expect(data.events[0].prefix).toBe("isPreviewReady")
+      expect(data.events[0].message).toContain("00:02")
+      expect(data.events[1].message).toContain("00:01")
+    } finally {
+      app.close()
+    }
+  })
+
+  test("query_logs excludes events containing excludeKeyword", async () => {
+    const app = await connectMockApp(relayPort)
+    try {
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "[JPush] Badge cleared successfully" } }))
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "[JPush] Registration ID updated successfully" } }))
+      await new Promise((r) => setTimeout(r, 100))
+
+      const res = await mcpRequest(mcpPort, {
+        jsonrpc: "2.0",
+        method: "tools/call",
+        id: 23,
+        params: {
+          name: "query_logs",
+          arguments: {
+            prefix: "JPush",
+            excludeKeyword: "Registration",
+            limit: 5,
+          },
+        },
+      })
+      const result = parseSSE(res.body)
+      const data = JSON.parse(result.result.content[0].text)
+      expect(data.status).toBe("success")
+      expect(data.count).toBe(1)
+      expect(data.events[0].message).toContain("Badge cleared successfully")
+      expect(data.filters.excludeKeyword).toBe("Registration")
+    } finally {
+      app.close()
+    }
+  })
+
+  test("query_logs supports keyword and excludeKeyword together", async () => {
+    const app = await connectMockApp(relayPort)
+    try {
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "[JPush] Badge cleared successfully" } }))
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "[JPush] Registration ID updated successfully" } }))
+      app.send(JSON.stringify({ type: "log", payload: { level: "debug", message: "[JPush] Registration ID failed" } }))
+      await new Promise((r) => setTimeout(r, 100))
+
+      const res = await mcpRequest(mcpPort, {
+        jsonrpc: "2.0",
+        method: "tools/call",
+        id: 24,
+        params: {
+          name: "query_logs",
+          arguments: {
+            prefix: "JPush",
+            keyword: "successfully",
+            excludeKeyword: "Registration",
+            limit: 5,
+          },
+        },
+      })
+      const result = parseSSE(res.body)
+      const data = JSON.parse(result.result.content[0].text)
+      expect(data.status).toBe("success")
+      expect(data.count).toBe(1)
+      expect(data.events[0].message).toContain("Badge cleared successfully")
+      expect(data.filters.keyword).toBe("successfully")
+      expect(data.filters.excludeKeyword).toBe("Registration")
     } finally {
       app.close()
     }

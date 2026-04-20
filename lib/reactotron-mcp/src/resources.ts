@@ -94,10 +94,10 @@ function filteredQueryGuidance(type: string) {
       return {
         status: "filtered_query_required",
         type,
-        message: "Log reads must use the query_logs tool with a required prefix. You can optionally add subprefix, keyword, limit, and timeRange.",
+        message: "Log reads must use the query_logs tool with a required prefix. You can optionally add subprefix, keyword, excludeKeyword, limit, and timeRange.",
         tool: "query_logs",
         required: ["prefix"],
-        optional: ["subprefix", "keyword", "limit", "timeRange", "clientId"],
+        optional: ["subprefix", "keyword", "excludeKeyword", "limit", "timeRange", "clientId"],
       }
     case "api.response":
       return {
@@ -126,6 +126,7 @@ export function registerResources(
   mcp: McpServer,
   server: ReactotronServer,
   commandBuffer: Command[],
+  getCommands: (() => Command[]) | undefined,
   getApps: GetApps = () =>
     (server.connections as any[]).map((c) => ({
       id: c.id,
@@ -136,13 +137,15 @@ export function registerResources(
       connected: true,
     }))
 ) {
+  const currentCommands = () => getCommands?.() ?? commandBuffer
+
   mcp.registerResource("timeline", "reactotron://timeline", {
     description: "Read this first to understand what's happening in the app. Returns summarized debug events (type, timestamp, and a short preview) newest-first. Payloads are stripped to keep the response small. For logs, network, and storage details, use the filtered query_logs, query_network, and query_storage tools instead of broad timeline reads.",
     mimeType: "application/json",
   }, async (uri) => {
     const apps = getApps()
     const meta = connectionMeta(apps)
-    const events = filterByClient(commandBuffer, apps)
+    const events = filterByClient(currentCommands(), apps)
     const summarized = [...events].reverse().map(summarizeCommand)
     return json(uri, { _meta: meta, eventCount: events.length, events: summarized },
       "Events are summarized. Use timeline_by_type only for non-log event types. For logs, network, and storage, use query_logs, query_network, or query_storage with explicit filters.")
@@ -151,7 +154,7 @@ export function registerResources(
   mcp.registerResource("timeline_by_type",
     new ResourceTemplate("reactotron://timeline/{type}", {
       list: async () => {
-        const types = [...new Set(commandBuffer.map((c) => c.type))]
+        const types = [...new Set(currentCommands().map((c) => c.type))]
         return {
           resources: types.map((t) => ({
             uri: `reactotron://timeline/${t}`,
@@ -161,7 +164,7 @@ export function registerResources(
       },
       complete: {
         type: async (value) => {
-          const types = [...new Set(commandBuffer.map((c) => c.type))]
+          const types = [...new Set(currentCommands().map((c) => c.type))]
           return types.filter((t) => t.startsWith(value))
         },
       },
@@ -178,7 +181,7 @@ export function registerResources(
       if (filteredGuidance) {
         return json(uri, { _meta: meta, ...filteredGuidance })
       }
-      const events = filterByClient(commandBuffer, apps)
+      const events = filterByClient(currentCommands(), apps)
         .filter((c) => c.type === resolvedType)
       return json(uri, { _meta: meta, type: resolvedType, eventCount: events.length, events: [...events].reverse() },
         `Too many ${resolvedType} events to return in full. Try clear_timeline to reset, then reproduce the issue to capture fewer events.`)
@@ -192,7 +195,7 @@ export function registerResources(
     const apps = getApps()
     const meta = connectionMeta(apps)
     const stateCommands = filterByClient(
-      commandBuffer.filter((c) => c.type === "state.values.response"),
+      currentCommands().filter((c) => c.type === "state.values.response"),
       apps
     )
     const latest = stateCommands[stateCommands.length - 1]
@@ -230,7 +233,7 @@ export function registerResources(
     const apps = getApps()
     const meta = connectionMeta(apps)
     const benchmarks = filterByClient(
-      commandBuffer.filter((c) => c.type === "benchmark.report"),
+      currentCommands().filter((c) => c.type === "benchmark.report"),
       apps
     )
     return json(uri, {
@@ -250,7 +253,7 @@ export function registerResources(
     const apps = getApps()
     const meta = connectionMeta(apps)
     const changes = filterByClient(
-      commandBuffer.filter((c) => c.type === "state.values.change"),
+      currentCommands().filter((c) => c.type === "state.values.change"),
       apps
     )
     return json(uri, {
